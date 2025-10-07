@@ -1,11 +1,5 @@
 # 🏥 MCP HealthCare Assistant 🤖
 
-**Author:** Aryan Gajjar  
-**Video Demo:** [Watch Here](https://youtu.be/p5_ihBBf7Ig)  
-**Documentation (Notion):** [Notion Link](https://www.notion.so/MCP-HealthCare-Assistant-285f2771eee180d6b3c8ea865a78f99a)  
-**GitHub Repository:** [GitHub Link](https://github.com/gajjararyan/mcp-health-copilot)
-
----
 
 ## Overview
 
@@ -63,8 +57,7 @@ The system leverages **Model Context Protocol (MCP)** and AI models (Gemini API)
 
 ## Setup Instructions
 
-### 1. Clone the repository
-
+1. Clone the repository
 ```bash
 git clone https://github.com/gajjararyan/mcp-health-copilot.git
 cd mcp-health-copilot
