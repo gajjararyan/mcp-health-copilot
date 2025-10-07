@@ -21,6 +21,7 @@ import dateparser
 # ---------------- Load Environment ----------------
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")  # Load Google Maps key
 
 # ---------------- Google Calendar Setup ----------------
 SCOPES = ['https://www.googleapis.com/auth/calendar.events']
@@ -165,19 +166,26 @@ def get_user_location():
 def get_nearby_pharmacies(medicine_name, user_latlng):
     lat, lng = user_latlng
     pharmacies = []
-    for i in range(1, 6):  # Mock 5 pharmacies
-        pharmacies.append({
-            "name": f"Pharmacy {i}",
-            "address": f"Address {i}, near {lat:.4f},{lng:.4f}",
-            "map_link": f"https://www.google.com/maps/search/{urllib.parse.quote(f'pharmacy near {lat},{lng}')}"
-        })
+    try:
+        url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={lat},{lng}&radius=3000&type=pharmacy&keyword={urllib.parse.quote(medicine_name)}&key={GOOGLE_MAPS_API_KEY}"
+        res = httpx.get(url, timeout=10)
+        results = res.json().get("results", [])
+        for p in results[:5]:  # top 5 pharmacies
+            pharmacies.append({
+                "name": p.get("name"),
+                "address": p.get("vicinity"),
+                "map_link": f"https://www.google.com/maps/search/?api=1&query={p['geometry']['location']['lat']},{p['geometry']['location']['lng']}"
+            })
+    except Exception as e:
+        print(f"Pharmacy API error: {e}")
+
+    if not pharmacies:
+        return f"No nearby pharmacies found for {medicine_name}."
+
     reply = f"Nearby pharmacies for {medicine_name}:\n"
     for p in pharmacies:
         reply += f"- {p['name']}, {p['address']} — [View Map]({p['map_link']})\n"
     return reply
-
-# ---------------- Appointment Memory ----------------
-ongoing_bookings = {}
 
 # ---------------- Extract Doctor Name ----------------
 def extract_doctor_name(text):
@@ -201,19 +209,32 @@ async def chat(request: Request):
 
     # Handle intents
     if intent == "appointment":
-        try:
-            doctor_name = extract_doctor_name(message_en)
-            date_time = dateparser.parse(message_en, settings={'PREFER_DATES_FROM': 'future'})
-            if not date_time:
-                raise ValueError("Could not parse date/time")
-            event = create_calendar_event(service, doctor_name, "Online consultation", date_time)
-            meet_link = event.get("hangoutLink", "")
-            reply_en = (f"✅ Your appointment with {doctor_name} is scheduled!\n"
-                        f"🕒 Time: {date_time.strftime('%I:%M %p')}\n"
-                        f"📅 Date: {date_time.strftime('%d-%m-%Y')}\n"
-                        f"💬 Meet Link: {meet_link}\n\nYou’ll get a calendar notification shortly!")
-        except Exception as e:
-            reply_en = f"Error parsing your appointment info: {e}\nPlease try again naturally like 'Dr. Sharma tomorrow at 3 PM'."
+        doctor_name = extract_doctor_name(message_en)
+        date_time = dateparser.parse(message_en, settings={'PREFER_DATES_FROM': 'future'})
+        if not date_time:
+            reply_en = (
+                "I can help you book an appointment, but I need a specific date and time.\n"
+                "Please provide it in this format:\n"
+                "- Doctor name (if not mentioned, default: Dr. Sharma)\n"
+                "- Date and time\n\n"
+                "Example messages you can send:\n"
+                "1. 'Dr. Sharma tomorrow at 10 AM'\n"
+                "2. 'General doctor on 15-10-2025 at 3 PM'\n"
+                "3. 'Book a physician appointment next Monday at 4:30 PM'"
+            )
+        else:
+            try:
+                event = create_calendar_event(service, doctor_name, "Online consultation", date_time)
+                meet_link = event.get("hangoutLink", "")
+                reply_en = (
+                    f"✅ Your appointment with {doctor_name} is scheduled!\n"
+                    f"🕒 Time: {date_time.strftime('%I:%M %p')}\n"
+                    f"📅 Date: {date_time.strftime('%d-%m-%Y')}\n"
+                    f"💬 Meet Link: {meet_link}\n\n"
+                    "You’ll get a calendar notification shortly!"
+                )
+            except Exception as e:
+                reply_en = f"Error scheduling appointment: {e}"
 
     elif intent == "symptom_check":
         reply_en = await check_symptom(message_en)
