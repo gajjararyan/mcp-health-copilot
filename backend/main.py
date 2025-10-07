@@ -1,27 +1,35 @@
 import os
+import re
+import urllib.parse
+import asyncio
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import httpx
+import geocoder
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
-import requests
-
-# Google Calendar imports
+from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
+from langdetect import detect
+from googletrans import Translator
+from dotenv import load_dotenv
+import dateparser
 
-# Load environment variables
-load_dotenv()
+# ---------------- Load Environment ----------------
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Google Calendar setup
+# ---------------- Google Calendar Setup ----------------
 SCOPES = ['https://www.googleapis.com/auth/calendar.events']
 creds = None
 if os.path.exists('backend/token.json'):
     creds = Credentials.from_authorized_user_file('backend/token.json', SCOPES)
 if not creds or not creds.valid:
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        creds.refresh(GoogleRequest())
     else:
         flow = InstalledAppFlow.from_client_secrets_file('backend/credentials.json', SCOPES)
         creds = flow.run_local_server(port=8080)
@@ -29,134 +37,204 @@ if not creds or not creds.valid:
         token.write(creds.to_json())
 service = build('calendar', 'v3', credentials=creds)
 
+# ---------------- Translator ----------------
+translator = Translator()
+
+async def translate_to_english(text):
+    try:
+        lang = detect(text)
+        if lang != 'en':
+            translated = translator.translate(text, src=lang, dest='en')
+            return translated.text, lang
+        return text, 'en'
+    except:
+        return text, 'en'
+
+async def translate_from_english(text, target_lang='en'):
+    try:
+        if target_lang != 'en':
+            translated = translator.translate(text, src='en', dest=target_lang)
+            return translated.text
+        return text
+    except:
+        return text
+
+# ---------------- Async Gemini API ----------------
+async def gemini_generate(prompt: str):
+    GEMINI_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                res = await client.post(GEMINI_URL, headers=headers, json=data)
+                res.raise_for_status()
+                result = res.json()
+                return (
+                    result.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "I'm here to help you.")
+                )
+        except httpx.ReadTimeout:
+            print(f"Gemini timeout on attempt {attempt+1}, retrying...")
+            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"Gemini API error: {e}")
+    return "Sorry, I couldn't reach Gemini right now. Please try again later."
+
+# ---------------- FastAPI Setup ----------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For demo, allow all. Restrict in prod.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory log
-logs = []
-
-# --- Gemini API Helper ---
-def gemini_generate(prompt):
-    url = "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent"
-    headers = {"Content-Type": "application/json"}
-    data = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ]
-    }
-    params = {"key": GEMINI_API_KEY}
-    try:
-        response = requests.post(url, headers=headers, params=params, json=data, timeout=10)
-        response.raise_for_status()
-        result = response.json()
-        return result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', "No response from Gemini.")
-    except Exception as e:
-        return f"Error contacting Gemini: {e}"
-
-# --- Intent Detection ---
-def detect_intent(message):
-    prompt = (
-        f"Classify the user's intent from this message: '{message}'. "
-        "Choose one of: symptom_check, medicine_suggest, appointment, reminder, log, chit_chat, unknown. "
-        "Reply with only the intent label."
-    )
-    intent = gemini_generate(prompt).strip().lower()
-    if intent not in ["symptom_check", "medicine_suggest", "appointment", "reminder", "log", "chit_chat"]:
-        intent = "unknown"
+# ---------------- Detect Intent ----------------
+async def detect_intent(message: str):
+    prompt = f"""
+    Detect user intent for: "{message}"
+    Choose one: symptom_check, medicine_suggest, appointment, order_medicine, chit_chat, help.
+    """
+    intent = (await gemini_generate(prompt)).strip().lower()
+    if intent not in ["symptom_check", "medicine_suggest", "appointment", "order_medicine", "chit_chat", "help"]:
+        msg = message.lower()
+        if any(word in msg for word in ["fever", "pain", "cough", "cold", "headache", "stomach", "stroke"]):
+            intent = "symptom_check"
+        elif any(word in msg for word in ["medicine", "tablet", "pill"]):
+            intent = "medicine_suggest"
+        elif any(word in msg for word in ["appointment", "doctor", "meet", "schedule"]):
+            intent = "appointment"
+        elif any(word in msg for word in ["order", "pharmacy", "buy medicine", "nearby"]):
+            intent = "order_medicine"
+        else:
+            intent = "chit_chat"
     return intent
 
-# --- Tool Functions ---
-def check_symptom(message):
-    prompt = (
-        f"You are a health assistant. A user says: '{message}'. "
-        "Give a short, safe, and clear health suggestion. "
-        "If it's an emergency, say so. If not, suggest seeing a doctor if needed. "
-        "Do not diagnose, just help."
-    )
-    return gemini_generate(prompt)
-
-def suggest_medicine(message):
-    prompt = (
-        f"You are a health assistant. A user asks: '{message}'. "
-        "Suggest only over-the-counter medicines if appropriate, with warnings. "
-        "If not appropriate, say to see a doctor. Never give prescription advice."
-    )
-    return gemini_generate(prompt)
-
-def create_calendar_event(summary, description, start_time, end_time):
+# ---------------- Calendar Event ----------------
+def create_calendar_event(service, doctor_name, description, start_time):
     event = {
-        'summary': summary,
+        'summary': f"Consultation with {doctor_name}",
         'description': description,
-        'start': {'dateTime': start_time, 'timeZone': 'Asia/Kolkata'},
-        'end': {'dateTime': end_time, 'timeZone': 'Asia/Kolkata'},
+        'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Kolkata'},
+        'end': {'dateTime': (start_time + timedelta(minutes=30)).isoformat(), 'timeZone': 'Asia/Kolkata'},
+        'conferenceData': {
+            'createRequest': {'conferenceSolutionKey': {'type': 'hangoutsMeet'}, 'requestId': 'healthcopilot-meet'}
+        },
+        'reminders': {'useDefault': True},
     }
-    event = service.events().insert(calendarId='primary', body=event).execute()
-    return f"Event created: {event.get('htmlLink')}"
+    event = service.events().insert(calendarId='primary', body=event, conferenceDataVersion=1).execute()
+    return event
 
-def book_appointment(message):
-    # For demo, book for tomorrow at 10am for 30 minutes
-    now = datetime.now()
-    start = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
-    end = start + timedelta(minutes=30)
-    return create_calendar_event(
-        summary="Doctor Appointment",
-        description=message,
-        start_time=start.isoformat(),
-        end_time=end.isoformat()
-    )
+# ---------------- Symptom Check ----------------
+async def check_symptom(message):
+    prompt = f"""
+    You are a professional doctor.
+    Respond empathetically to: "{message}".
+    Include:
+    - Home remedies
+    - OTC medicines with dosage and timing
+    - When to see a doctor
+    End by offering to schedule a doctor.
+    Keep it under 200 words.
+    """
+    return await gemini_generate(prompt)
 
-def set_reminder(message):
-    # For demo, set for today at 8pm for 15 minutes
-    now = datetime.now()
-    start = now.replace(hour=20, minute=0, second=0, microsecond=0)
-    end = start + timedelta(minutes=15)
-    return create_calendar_event(
-        summary="Health Reminder",
-        description=message,
-        start_time=start.isoformat(),
-        end_time=end.isoformat()
-    )
+# ---------------- Medicine Suggest ----------------
+async def suggest_medicine(message):
+    prompt = f"""
+    You are a helpful pharmacist.
+    Suggest safe medicines for: "{message}".
+    Include dosage and timing in a clear table format if possible.
+    Offer home care tips and advise to see a doctor if needed.
+    """
+    return await gemini_generate(prompt)
 
-def log_action(action, detail):
-    logs.append({"time": datetime.now().isoformat(), "action": action, "detail": detail})
+# ---------------- Get User Location ----------------
+def get_user_location():
+    g = geocoder.ip('me')
+    if g.ok:
+        return g.latlng  # [lat, lng]
+    return [23.2156, 72.6369]  # fallback Gandhinagar
 
-def get_logs():
-    if not logs:
-        return "No health records found."
-    return "\n".join([f"{l['time']}: [{l['action']}] {l['detail']}" for l in logs])
+# ---------------- Nearby Pharmacies ----------------
+def get_nearby_pharmacies(medicine_name, user_latlng):
+    lat, lng = user_latlng
+    pharmacies = []
+    for i in range(1, 6):  # Mock 5 pharmacies
+        pharmacies.append({
+            "name": f"Pharmacy {i}",
+            "address": f"Address {i}, near {lat:.4f},{lng:.4f}",
+            "map_link": f"https://www.google.com/maps/search/{urllib.parse.quote(f'pharmacy near {lat},{lng}')}"
+        })
+    reply = f"Nearby pharmacies for {medicine_name}:\n"
+    for p in pharmacies:
+        reply += f"- {p['name']}, {p['address']} — [View Map]({p['map_link']})\n"
+    return reply
 
+# ---------------- Appointment Memory ----------------
+ongoing_bookings = {}
+
+# ---------------- Extract Doctor Name ----------------
+def extract_doctor_name(text):
+    match = re.search(r"(Dr\.?\s+[A-Za-z]+|General doctor|specialist|physician)", text, re.I)
+    if match:
+        return match.group(0)
+    return "Doctor"
+
+# ---------------- Chat Endpoint ----------------
 @app.post("/chat")
 async def chat(request: Request):
     data = await request.json()
     message = data.get("message", "")
-    intent = detect_intent(message)
-    reply = "Sorry, I didn't understand. Try asking about symptoms, medicines, appointments, or reminders."
+    user_id = data.get("user_id", "default")
 
-    if intent == "symptom_check":
-        reply = check_symptom(message)
-        log_action("Symptom Check", message)
+    # Translate user message to English
+    message_en, user_lang = await translate_to_english(message)
+
+    # Detect intent
+    intent = await detect_intent(message_en)
+
+    # Handle intents
+    if intent == "appointment":
+        try:
+            doctor_name = extract_doctor_name(message_en)
+            date_time = dateparser.parse(message_en, settings={'PREFER_DATES_FROM': 'future'})
+            if not date_time:
+                raise ValueError("Could not parse date/time")
+            event = create_calendar_event(service, doctor_name, "Online consultation", date_time)
+            meet_link = event.get("hangoutLink", "")
+            reply_en = (f"✅ Your appointment with {doctor_name} is scheduled!\n"
+                        f"🕒 Time: {date_time.strftime('%I:%M %p')}\n"
+                        f"📅 Date: {date_time.strftime('%d-%m-%Y')}\n"
+                        f"💬 Meet Link: {meet_link}\n\nYou’ll get a calendar notification shortly!")
+        except Exception as e:
+            reply_en = f"Error parsing your appointment info: {e}\nPlease try again naturally like 'Dr. Sharma tomorrow at 3 PM'."
+
+    elif intent == "symptom_check":
+        reply_en = await check_symptom(message_en)
+
     elif intent == "medicine_suggest":
-        reply = suggest_medicine(message)
-        log_action("Medicine Suggest", message)
-    elif intent == "appointment":
-        reply = book_appointment(message)
-        log_action("Appointment", message)
-    elif intent == "reminder":
-        reply = set_reminder(message)
-        log_action("Reminder", message)
-    elif intent == "log":
-        reply = get_logs()
+        reply_en = await suggest_medicine(message_en)
+
+    elif intent == "order_medicine":
+        user_location = get_user_location()
+        reply_en = get_nearby_pharmacies(message_en, user_location)
+
     elif intent == "chit_chat":
-        reply = gemini_generate(f"Chat with the user: {message}")
+        reply_en = await gemini_generate(f"Be a friendly healthcare companion and chat nicely: {message_en}")
+
+    elif intent == "help":
+        reply_en = "I can help you with symptoms, medicines, reminders, booking doctor appointments, and ordering medicines nearby."
+
+    else:
+        reply_en = "I'm not sure I understood that. Could you please clarify?"
+
+    # Translate reply back to user's language
+    reply = await translate_from_english(reply_en, target_lang=user_lang)
 
     return {"reply": reply, "intent": intent}

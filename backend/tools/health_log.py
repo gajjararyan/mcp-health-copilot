@@ -1,7 +1,8 @@
+from datetime import datetime
+
 logs = []
 
 def log_action(action, detail):
-    from datetime import datetime
     logs.append({"time": datetime.now().isoformat(), "action": action, "detail": detail})
 
 def get_logs():

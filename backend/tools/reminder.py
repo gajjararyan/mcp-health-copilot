@@ -1,3 +1,14 @@
-def set_reminder(message):
-    # For MVP, just mock
-    return "Medication reminder set! (For MVP, this is a mock. You can integrate Google Calendar or Telegram bot for real reminders.)"
+from datetime import datetime, timedelta
+from .calendar_utils import create_calendar_event
+
+def set_reminder(message, service):
+    now = datetime.now()
+    start = now.replace(hour=20, minute=0, second=0, microsecond=0)
+    end = start + timedelta(minutes=15)
+    return create_calendar_event(
+        service=service,
+        summary="Health Reminder",
+        description=message,
+        start_time=start.isoformat(),
+        end_time=end.isoformat()
+    )
