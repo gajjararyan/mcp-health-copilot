@@ -17,11 +17,12 @@ from langdetect import detect
 from googletrans import Translator
 from dotenv import load_dotenv
 import dateparser
+from dateparser.search import search_dates
 
 # ---------------- Load Environment ----------------
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")  # Load Google Maps key
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
 # ---------------- Google Calendar Setup ----------------
 SCOPES = ['https://www.googleapis.com/auth/calendar.events']
@@ -165,34 +166,37 @@ def get_user_location():
 # ---------------- Nearby Pharmacies ----------------
 def get_nearby_pharmacies(medicine_name, user_latlng):
     lat, lng = user_latlng
-    pharmacies = []
     try:
         url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={lat},{lng}&radius=3000&type=pharmacy&keyword={urllib.parse.quote(medicine_name)}&key={GOOGLE_MAPS_API_KEY}"
         res = httpx.get(url, timeout=10)
         results = res.json().get("results", [])
-        for p in results[:5]:  # top 5 pharmacies
-            pharmacies.append({
-                "name": p.get("name"),
-                "address": p.get("vicinity"),
-                "map_link": f"https://www.google.com/maps/search/?api=1&query={p['geometry']['location']['lat']},{p['geometry']['location']['lng']}"
-            })
-    except Exception as e:
-        print(f"Pharmacy API error: {e}")
-
-    if not pharmacies:
-        return f"No nearby pharmacies found for {medicine_name}."
-
-    reply = f"Nearby pharmacies for {medicine_name}:\n"
-    for p in pharmacies:
-        reply += f"- {p['name']}, {p['address']} — [View Map]({p['map_link']})\n"
-    return reply
+        if not results:
+            return f"No nearby pharmacies found. You can check: https://www.google.com/maps/search/pharmacy+near+me/@{lat},{lng},15z"
+        reply = f"Nearby pharmacies for {medicine_name}:\n"
+        for p in results[:5]:
+            lat_p = p['geometry']['location']['lat']
+            lng_p = p['geometry']['location']['lng']
+            reply += f"- {p['name']}, {p.get('vicinity','')} — [View Map](https://www.google.com/maps/search/?api=1&query={lat_p},{lng_p})\n"
+        return reply
+    except:
+        return f"Couldn't fetch nearby pharmacies. Try: https://www.google.com/maps/search/pharmacy+near+me/@{lat},{lng},15z"
 
 # ---------------- Extract Doctor Name ----------------
 def extract_doctor_name(text):
     match = re.search(r"(Dr\.?\s+[A-Za-z]+|General doctor|specialist|physician)", text, re.I)
     if match:
         return match.group(0)
-    return "Doctor"
+    return "Dr. Sharma"
+
+# ---------------- Extract DateTime ----------------
+def extract_datetime(text):
+    results = search_dates(text, settings={'PREFER_DATES_FROM': 'future'})
+    if results:
+        dt = results[0][1]
+        if dt.hour == 0 and dt.minute == 0:
+            dt = dt.replace(hour=9, minute=0)
+        return dt
+    return None
 
 # ---------------- Chat Endpoint ----------------
 @app.post("/chat")
@@ -210,17 +214,15 @@ async def chat(request: Request):
     # Handle intents
     if intent == "appointment":
         doctor_name = extract_doctor_name(message_en)
-        date_time = dateparser.parse(message_en, settings={'PREFER_DATES_FROM': 'future'})
+        date_time = extract_datetime(message_en)
+
         if not date_time:
             reply_en = (
                 "I can help you book an appointment, but I need a specific date and time.\n"
-                "Please provide it in this format:\n"
-                "- Doctor name (if not mentioned, default: Dr. Sharma)\n"
-                "- Date and time\n\n"
-                "Example messages you can send:\n"
-                "1. 'Dr. Sharma tomorrow at 10 AM'\n"
-                "2. 'General doctor on 15-10-2025 at 3 PM'\n"
-                "3. 'Book a physician appointment next Monday at 4:30 PM'"
+                "Example messages:\n"
+                "'Dr. Sharma tomorrow at 10 AM'\n"
+                "'General doctor on 15-10-2025 at 3 PM'\n"
+                "'Book a physician appointment next Monday at 4:30 PM'"
             )
         else:
             try:
